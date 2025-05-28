@@ -1,0 +1,10 @@
+P1,acquire,M1,0
+P2,acquire,M1,1
+P3,acquire,S1,2
+P4,acquire,S1,3
+P3,release,S1,4
+P1,release,M1,5
+P2,release,M1,6
+P5,acquire,S1,6
+P4,release,S1,7
+P5,release,S1,8
