@@ -1,0 +1,25 @@
+/* Botones principales */
+.stButton > button {
+    background-color: #F94144 !important;
+    color: white !important;
+}
+
+/* Botones hover */
+.stButton > button:hover {
+    background-color: #F3722C !important;
+}
+
+/* Encabezados */
+h1 {
+    color: #277DA1 !important;
+}
+
+/* Widgets activos */
+.stRadio > div[role="radiogroup"] > label[data-baseweb="radio"]:first-child > div:first-child {
+    background-color: #90BE6D !important;
+}
+
+/* Sidebar */
+[data-testid="stSidebar"] {
+    background-color: #43AA8B !important;
+}

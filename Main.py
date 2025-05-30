@@ -2,535 +2,290 @@ import time
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from dataclasses import dataclass
-from collections import deque
+from parsers import parse_processes_txt, parse_resources_txt, parse_actions_txt
+from schedulers import (
+    Process,
+    fifo_scheduler, sjf_scheduler, srt_scheduler,
+    rr_scheduler, priority_scheduler
+)
+from synchronization import simulate_sync
+from visualization import animate_by_process, animate_by_cycle, animate_line_state
 
-@dataclass
-class Process:
-    pid: str
-    arrival: int
-    burst: int
-    priority: int = None    
-    remaining: int = None
+def local_css(file_name):
+    with open(file_name) as f:
+        st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
 
-    def __post_init__(self):
-        if self.remaining is None:
-            self.remaining = self.burst
+local_css(".streamlit/style.css")  
 
-@dataclass
-class Event:
-    pid: str
-    time: int
-    action: str       # "acquire" o "release"
-    resource: str
-
-class Mutex:
-    def __init__(self, name):
-        self.name = name
-        self.locked_by = None
-        self.queue = deque()
-
-    def acquire(self, pid, now, timeline):
-        if self.locked_by is None:
-            self.locked_by = pid
-            timeline.append((now, pid, "acquired", self.name))
-        else:
-            self.queue.append(pid)
-            timeline.append((now, pid, "waiting", self.name))
-
-    def release(self, pid, now, timeline):
-        if self.locked_by != pid:
-            raise RuntimeError(f"{pid} libera un mutex que no posee")
-        if self.queue:
-            nxt = self.queue.popleft()
-            self.locked_by = nxt
-            timeline.append((now, nxt, "acquired", self.name))
-        else:
-            self.locked_by = None
-        timeline.append((now, pid, "released", self.name))
-
-class Semaphore:
-    def __init__(self, name, initial):
-        self.name = name
-        self.count = initial
-        self.queue = deque()
-
-    def acquire(self, pid, now, timeline):
-        if self.count > 0:
-            self.count -= 1
-            timeline.append((now, pid, "acquired", self.name))
-        else:
-            self.queue.append(pid)
-            timeline.append((now, pid, "waiting", self.name))
-
-    def release(self, pid, now, timeline):
-        # para semáforos generalmente no se valida owner
-        if self.queue:
-            nxt = self.queue.popleft()
-            timeline.append((now, nxt, "acquired", self.name))
-        else:
-            self.count += 1
-        timeline.append((now, pid, "released", self.name))
-
-import pandas as pd
-
-def simulate_sync(df_events, mode, sem_init=None):
-    """
-    df_events: DataFrame con columnas pid,time,action,resource,[initial]
-    mode: "Mutex" o "Semaphore"
-    sem_init: dict{name:count} para semáforos
-    """
-    # 1) crear instancias por recurso
-    resources = {}
-    timeline = []   # lista de (time,pid,status,resource)
-
-    # si es semáforo, leemos conteos iniciales
-    if mode == "Semaphore":
-        for name, cnt in sem_init.items():
-            resources[name] = Semaphore(name, cnt)
-
-    # 2) ordenar eventos
-    evs = df_events.sort_values("time").itertuples()
-
-    # 3) procesar uno a uno
-    for ev in evs:
-        rsrc = ev.resource
-        if rsrc not in resources:
-            # creamos mutex o semáforo según mode
-            if mode == "Mutex":
-                resources[rsrc] = Mutex(rsrc)
-            else:
-                raise ValueError(f"Falta count para semáforo {rsrc}")
-        res = resources[rsrc]
-
-        if ev.action == "acquire":
-            res.acquire(ev.pid, ev.time, timeline)
-        else:
-            res.release(ev.pid, ev.time, timeline)
-
-    # devolvemos el timeline de sincronización
-    return pd.DataFrame(timeline, columns=["time","pid","status","resource"])
-
-def fifo_scheduler(processes):
-    time_ptr = 0
-    tl = []
-    for p in sorted(processes, key=lambda x: x.arrival):
-        start = max(time_ptr, p.arrival)
-        end = start + p.burst
-        tl.append((p.pid, start, end))
-        time_ptr = end
-    return tl
-
-def timeline_to_df(tl):
-    return pd.DataFrame(tl, columns=['Process','start','end'])
-
-def sjf_scheduler(procs: list[Process]) -> list[tuple]:
-    """SJF no-preemptivo."""
-    time = 0
-    timeline = []
-    remaining = {p.pid: p for p in procs}
-    done = set()
-    while len(done) < len(procs):
-        ready = [p for p in procs if p.arrival <= time and p.pid not in done]
-        if ready:
-            p = min(ready, key=lambda x: x.burst)
-            start = max(time, p.arrival)
-            end = start + p.burst
-            timeline.append((p.pid, start, end))
-            time = end
-            done.add(p.pid)
-        else:
-            time += 1
-    return timeline
-
-def srt_scheduler(procs: list[Process]) -> list[tuple]:
-    """SRT preemptivo."""
-    time = 0
-    rem = {p.pid: p.burst for p in procs}
-    timeline = []
-    current, start = None, 0
-
-    while True:
-        arrived = [p for p in procs if p.arrival <= time and rem[p.pid] > 0]
-        if arrived:
-            p = min(arrived, key=lambda x: rem[x.pid])
-            if current != p.pid:
-                if current is not None:
-                    timeline.append((current, start, time))
-                current, start = p.pid, time
-            rem[p.pid] -= 1
-        else:
-            # si no hay ready y todo está hecho, cortamos
-            if all(v == 0 for v in rem.values()):
-                break
-        time += 1
-
-    if current is not None:
-        timeline.append((current, start, time))
-    return timeline
-
-def rr_scheduler(procs: list[Process], quantum: int) -> list[tuple]:
-    """Round Robin preemptivo."""
-    time = 0
-    queue = deque()
-    timeline = []
-    rem = {p.pid: p.burst for p in procs}
-    sorted_procs = sorted(procs, key=lambda x: x.arrival)
-    idx = 0
-
-    while True:
-        # encolar llegadas
-        while idx < len(sorted_procs) and sorted_procs[idx].arrival <= time:
-            queue.append(sorted_procs[idx].pid)
-            idx += 1
-
-        if not queue:
-            if idx < len(sorted_procs):
-                time = sorted_procs[idx].arrival
-                continue
-            else:
-                break
-
-        pid = queue.popleft()
-        slice_len = min(quantum, rem[pid])
-        start, end = time, time + slice_len
-        timeline.append((pid, start, end))
-        rem[pid] -= slice_len
-        time = end
-
-        # encolar nuevas llegadas durante el slice
-        while idx < len(sorted_procs) and sorted_procs[idx].arrival <= time:
-            queue.append(sorted_procs[idx].pid)
-            idx += 1
-        if rem[pid] > 0:
-            queue.append(pid)
-
-    return timeline
-
-def priority_scheduler(procs: list[Process], preemptive: bool) -> list[tuple]:
-    """Priority, preemptivo o no."""
-    time = 0
-    rem = {p.pid: p.burst for p in procs}
-    prio = {p.pid: p.priority for p in procs}
-    timeline = []
-    current, start = None, 0
-
-    while True:
-        ready = [p for p in procs if p.arrival <= time and rem[p.pid] > 0]
-        if ready:
-            p = min(ready, key=lambda x: prio[x.pid])
-            if preemptive:
-                if current != p.pid:
-                    if current is not None:
-                        timeline.append((current, start, time))
-                    current, start = p.pid, time
-                rem[p.pid] -= 1
-                time += 1
-            else:
-                # run to completion
-                st = max(time, p.arrival)
-                en = st + rem[p.pid]
-                timeline.append((p.pid, st, en))
-                time = en
-                rem[p.pid] = 0
-        else:
-            if all(v == 0 for v in rem.values()):
-                break
-            # avanzar al siguiente arribo
-            next_arrival = min(p.arrival for p in procs if rem[p.pid] > 0)
-            time = next_arrival
-
-    if preemptive and current is not None:
-        timeline.append((current, start, time))
-    return timeline
-
-def animate_by_process(tl, cmax, placeholder, delay=0.7):
-    shown = []
-    for pid, s, e in tl:
-        shown.append((pid, s, e))
-        df = pd.DataFrame(shown, columns=['Process','start','end'])
-        fig = px.bar(df, x='end', base='start', y='Process',
-                     orientation='h', color='Process',
-                     title=f"Procesos completados: {len(shown)}/{len(tl)}")
-        fig.update_yaxes(autorange='reversed')
-        fig.update_xaxes(title='Tiempo', range=[0, cmax+1])
-        placeholder.plotly_chart(fig, use_container_width=True)
-        time.sleep(delay)
-
-def animate_by_cycle(tl, cmax, placeholder, delay=0.3):
-    df_all = pd.DataFrame(tl, columns=['Process','start','end'])
-    for t in range(0, cmax+1):
-        vis = df_all.assign(
-            ds = df_all['start'].clip(upper=t),
-            de = df_all['end'].clip(upper=t)
-        ).query("ds < de")
-        fig = px.bar(vis, x='de', base='ds', y='Process',
-                     orientation='h', color='Process',
-                     title=f"Ciclo {t}/{cmax}")
-        fig.update_yaxes(autorange='reversed')
-        fig.update_xaxes(title='Tiempo', range=[0, cmax+1])
-        placeholder.plotly_chart(fig, use_container_width=True)
-        time.sleep(delay)
-
-def build_sync_gantt(df_tl: pd.DataFrame) -> pd.DataFrame:
-    """
-    Toma el DataFrame con columnas [time, pid, status, resource]
-    y devuelve otro con columnas [resource, pid, start, end],
-    donde cada fila es un intervalo en que pid mantuvo el recurso.
-    """
-    segments = []
-    # clave temporal para “acquired” pendientes
-    start_times: dict[tuple[str,str], int] = {}
-
-    for _, row in df_tl.iterrows():
-        key = (row["resource"], row["pid"])
-        t, status = row["time"], row["status"]
-        if status == "acquired":
-            start_times[key] = t
-        elif status == "released" and key in start_times:
-            segments.append({
-                "resource": row["resource"],
-                "pid":      row["pid"],
-                "start":    start_times[key],
-                "end":      t
-            })
-            del start_times[key]
-
-    return pd.DataFrame(segments)
-
-def animate_sync_visual(df_tl: pd.DataFrame, sync_type: str, sem_init: dict[str,int] = None, delay: float = 0.7):
-    visual_ph = st.empty()
-    status_ph = st.empty()
-    event_ph = st.empty()
-    history_ph = st.empty()
-    
-    segments = []
-    start_times = {}
-    
-    # Estado inicial
-    if sync_type == "Mutex":
-        unique_resources = df_tl["resource"].unique()
-        resource_state = {r: None for r in unique_resources}
-    else:
-        if sem_init is None:
-            raise ValueError("sem_init es requerido para semáforos")
-        resource_state = sem_init.copy()
-    
-    df_sorted = df_tl.sort_values("time").reset_index(drop=True)
-    
-    for idx, row in df_sorted.iterrows():
-        t, pid, status, rsrc = row["time"], row["pid"], row["status"], row["resource"]
-        key = (rsrc, pid)
-        
-        # Lógica acquire/release
-        if status == "acquired":
-            start_times[key] = t
-            if sync_type == "Mutex":
-                resource_state[rsrc] = pid
-            else:
-                resource_state[rsrc] -= 1
-        else:
-            if key in start_times:
-                segments.append({
-                    "resource": rsrc, 
-                    "pid": str(pid),
-                    "start": start_times[key],
-                    "end": t,
-                    "duration": t - start_times[key]
-                })
-                del start_times[key]
-                
-            if sync_type == "Mutex":
-                resource_state[rsrc] = None
-            else:
-                resource_state[rsrc] += 1
-        
-        # VISUALIZACIÓN PRINCIPAL: Crear representación visual
-        with visual_ph.container():
-            st.markdown(f"### Estado de {sync_type} en tiempo t={t}")
-            
-            # Crear columnas para cada recurso
-            resources = list(resource_state.keys())
-            if len(resources) <= 4:
-                cols = st.columns(len(resources))
-            else:
-                # Si hay muchos recursos, hacer filas
-                cols = st.columns(min(4, len(resources)))
-            
-            for i, (resource, state) in enumerate(resource_state.items()):
-                col_idx = i % len(cols)
-                
-                with cols[col_idx]:
-                    if sync_type == "Mutex":
-                        if state is None:
-                            st.markdown(f"""
-                            <div style="text-align: center; padding: 20px; border: 2px solid green; border-radius: 10px; background-color: #d4f4dd;">
-                                <h4>{resource}</h4>
-                                <div style="font-size: 30px;">🟢</div>
-                                <p><b>LIBRE</b></p>
-                            </div>
-                            """, unsafe_allow_html=True)
-                        else:
-                            st.markdown(f"""
-                            <div style="text-align: center; padding: 20px; border: 2px solid red; border-radius: 10px; background-color: #fdd4d4;">
-                                <h4>{resource}</h4>
-                                <div style="font-size: 30px;">🔴</div>
-                                <p><b>Ocupado por:</b><br>{state}</p>
-                            </div>
-                            """, unsafe_allow_html=True)
-                    else:  # Semáforos
-                        total = sem_init[resource]
-                        available = state
-                        used = total - available
-                        
-                        # Crear círculos para representar el semáforo
-                        circles = ""
-                        for j in range(total):
-                            if j < used:
-                                circles += "🔴 "  # Ocupado
-                            else:
-                                circles += "🟢 "  # Disponible
-                        
-                        color = "green" if available > 0 else "red"
-                        bg_color = "#d4f4dd" if available > 0 else "#fdd4d4"
-                        
-                        st.markdown(f"""
-                        <div style="text-align: center; padding: 20px; border: 2px solid {color}; border-radius: 10px; background-color: {bg_color};">
-                            <h4>{resource}</h4>
-                            <div style="font-size: 20px;">{circles}</div>
-                            <p><b>Disponible:</b> {available}/{total}</p>
-                        </div>
-                        """, unsafe_allow_html=True)
-        
-        # Historial de uso
-        if segments:
-            with history_ph.container():
-                st.markdown("### Historial de uso")
-                df_segments = pd.DataFrame(segments)
-                
-                # Mostrar como tabla simple
-                for _, seg in df_segments.iterrows():
-                    st.markdown(f"• **{seg['pid']}** usó **{seg['resource']}** desde t={seg['start']} hasta t={seg['end']} (duración: {seg['duration']})")
-        
-        # Estado en tabla
-        if sync_type == "Mutex":
-            df_state = pd.DataFrame([
-                {"Resource": rsrc, "Owner": owner if owner else "🟢 LIBRE"}
-                for rsrc, owner in resource_state.items()
-            ])
-        else:
-            df_state = pd.DataFrame([
-                {"Resource": rsrc, "Available": f"{count}/{sem_init[rsrc]}"}
-                for rsrc, count in resource_state.items()
-            ])
-        
-        status_ph.table(df_state)
-        
-        # Evento actual
-        verb = "adquirió" if status == "acquired" else "liberó"
-        color = "🟢" if status == "acquired" else "🔴"
-        event_ph.markdown(f"**t={t}**: {color} `{pid}` **{verb}** `{rsrc}`")
-        
-        time.sleep(delay)
-    
-    st.success(f"🔒 Animación de {sync_type} completada")
-
-def run_animation(tl, cmax, algo, placeholder):
-    if algo in ["FIFO", "SJF (no-preempt)"]:
-        animate_by_process(tl, cmax, placeholder)
-    else:
-        animate_by_cycle(tl, cmax, placeholder)
 def main():
-    st.set_page_config(layout="wide")
-    st.sidebar.header("Modo de simulación")
+    st.sidebar.header("🔧 Modo de simulación")
     mode = st.sidebar.radio("¿Qué quieres simular?", ["Calendarización", "Sincronización"])
 
     if mode == "Calendarización":
-        # —– Sidebar calendarización —
-        algo = st.sidebar.selectbox(
-            "Algoritmo",
-            ["FIFO", "SJF (no-preempt)", "SRT", "Round Robin", "Priority"]
+        # Selección múltiple de algoritmos
+        algos = st.sidebar.multiselect(
+            "Algoritmos",
+            ["FIFO", "SJF (no-preempt)", "SRT", "Round Robin", "Priority"],
+            default=["FIFO"]
         )
-        quantum = st.sidebar.slider("Quantum", 1, 10, 2) if algo == "Round Robin" else None
-        preempt = st.sidebar.checkbox("Preemptivo", True) if algo == "Priority" else None
+        # Controles condicionales
+        quantum = st.sidebar.slider("Quantum (RR)", 1, 20, 2) if "Round Robin" in algos else None
+        preempt = st.sidebar.checkbox("Priority preemptiva", True) if "Priority" in algos else None
+        proc_file = st.sidebar.file_uploader("Procesos (.txt)", type="txt")
+        run_btn = st.sidebar.button("▶️ Ejecutar Calendarización")
 
-        st.header(f"🏷️ Calendarización — {algo}")
-        uploaded = st.file_uploader(
-            "Sube CSV con pid,arrival,burst,priority",
-            type=['csv']
-        )
+        if proc_file and run_btn:
+            df_proc = parse_processes_txt(proc_file)
+            procs = [Process(r.pid, r.arrival, r.burst, r.priority) for r in df_proc.itertuples()]
 
-        if uploaded and st.button("▶️ Ejecutar calendarización"):
-            df = pd.read_csv(uploaded)
-            required_cols = {'pid', 'arrival', 'burst', 'priority'}
-            if not required_cols.issubset(df.columns):
-                st.error(f"El CSV debe contener columnas: {', '.join(required_cols)}")
-                return
+            # Simular cada algoritmo
+            timelines = {}
+            for algo in algos:
+                if algo == "FIFO":
+                    tl = fifo_scheduler(procs)
+                elif algo == "SJF (no-preempt)":
+                    tl = sjf_scheduler(procs)
+                elif algo == "SRT":
+                    tl = srt_scheduler(procs)
+                elif algo == "Round Robin":
+                    tl = rr_scheduler(procs, quantum)
+                else:  # Priority
+                    tl = priority_scheduler(procs, preempt)
+                df_tl = pd.DataFrame(tl, columns=["Process", "start", "end"])
+                timelines[algo] = df_tl
 
-            procs = []
-            for _, row in df.iterrows():
-                procs.append(
-                    Process(
-                        pid      = str(row["pid"]),
-                        arrival  = int(row["arrival"]),
-                        burst    = int(row["burst"]),
-                        priority = int(row["priority"])
+            global_cmax = max(df["end"].max() for df in timelines.values())
+
+            # Colores fijos por PID
+            pids = [p.pid for p in procs]
+            colors = px.colors.qualitative.Plotly
+            color_map = {pid: colors[i % len(colors)] for i, pid in enumerate(pids)}
+
+            # 6) Creamos un placeholder full-width por cada algoritmo
+            placeholders = {
+                algo: st.empty()
+                for algo in algos
+            }
+
+            # 7) Animar ciclo a ciclo
+            for t in range(0, int(global_cmax) + 1):
+                for algo, df in timelines.items():
+                    # filtrar la porción hasta el ciclo t
+                    vis = (
+                        df
+                        .assign(
+                            ds = df["start"].clip(upper=t),
+                            de = df["end"].clip(upper=t)
+                        )
+                        .query("ds < de")
                     )
-                )
+                    fig = px.bar(
+                        vis,
+                        x="de", base="ds",
+                        y="Process",
+                        orientation="h",
+                        color="Process",
+                        title=f"{algo} — Ciclo {t}/{int(global_cmax)}",
+                        color_discrete_map=color_map  # tu mapeo PID→color
+                    )
+                    fig.update_yaxes(autorange="reversed")
+                    fig.update_xaxes(range=[0, global_cmax], title="Ciclo")
+                    fig.update_layout(showlegend=True, height=250)
 
-            # Selección del scheduler
-            if algo == "FIFO":
-                tl = fifo_scheduler(procs)
-            elif algo == "SJF (no-preempt)":
-                tl = sjf_scheduler(procs)
-            elif algo == "SRT":
-                tl = srt_scheduler(procs)
-            elif algo == "Round Robin":
-                tl = rr_scheduler(procs, quantum)
-            else:  # Priority
-                tl = priority_scheduler(procs, preempt)
+                    # **Aquí** uso el placeholder correcto:
+                    placeholders[algo].plotly_chart(fig, use_container_width=True)
 
-            # Animación y métricas
-            cmax = max(end for _, _, end in tl)
-            placeholder = st.empty()
-            run_animation(tl, cmax, algo, placeholder)
+                # pausa para animar
+                time.sleep(0.4)
+            
+            arrival_map = {p.pid: p.arrival for p in procs}
 
-            waiting_times = [
-                start - next(p.arrival for p in procs if p.pid == pid)
-                for pid, start, _ in tl
-            ]
-            st.success(f"⏱️ Tiempo de espera promedio: {sum(waiting_times)/len(waiting_times):.2f} ciclos")
+            metrics = []
+            for algo, df in timelines.items():
+                # df tiene columnas ['Process','start','end']
+                waits    = [row.start - arrival_map[row.Process]   for row in df.itertuples()]
+                turnaround = [row.end   - arrival_map[row.Process] for row in df.itertuples()]
+
+                metrics.append({
+                    'Algoritmo'        : algo,
+                    'Espera Media'     : sum(waits) / len(waits),
+                    'Turnaround Medio' : sum(turnaround) / len(turnaround)
+                })
+
+            df_metrics = pd.DataFrame(metrics).set_index('Algoritmo')
+
+            st.subheader("📊 Métricas de Scheduling")
+            st.dataframe(df_metrics)
+
+            # 9) Gráfica de barras comparativa
+            fig_m = px.bar(
+                df_metrics.reset_index(),
+                x='Algoritmo',
+                y=['Espera Media','Turnaround Medio'],
+                barmode='group',
+                labels={
+                'value': 'Tiempo (ciclos)',
+                'variable': 'Métrica'
+                },
+                title='Comparativa de Espera y Turnaround'
+            )
+            fig_m.update_layout(margin=dict(l=40,r=40,t=60,b=40))
+            st.plotly_chart(fig_m, use_container_width=True)
+
+            # 10) Mensaje de finalización
+            st.success("✅ Animación de Calendarización completada y métricas mostradas")
+
 
     else:
-        # —– Sidebar sincronización —
-        sync_type = st.sidebar.selectbox("Tipo de sincronización", ["Mutex", "Semaphore"])
-        st.header(f"🔒 Sincronización — {sync_type}")
+        # Sincronización concurrente
+        sync_modes = st.sidebar.multiselect(
+            "Modos de sincronización",
+            ["Mutex", "Semaphore"],
+            default=["Mutex", "Semaphore"]
+        )
+        f_proc = st.sidebar.file_uploader("Procesos (.txt)", type="txt")
+        f_res  = st.sidebar.file_uploader("Recursos (.txt)", type="txt")
+        f_act  = st.sidebar.file_uploader("Acciones (.txt)", type="txt")
+        run_sync = st.sidebar.button("▶️ Ejecutar Sincronización")
 
-        f_proc = st.file_uploader("Procesos (.txt)", type="txt")
-        f_res  = st.file_uploader("Recursos (.txt)", type="txt")
-        f_act  = st.file_uploader("Acciones (.txt)", type="txt")
-
-        if st.button("▶️ Ejecutar sincronización"):
+        if run_sync:
             if not (f_proc and f_res and f_act):
-                st.error("Debes subir los 3 archivos: procesos, recursos y acciones.")
+                st.error("Debes subir los 3 archivos: procesos, recursos y acciones")
                 return
 
-            # 1) Procesos (solo usamos PID aquí, aunque leemos el resto)
-            df_p = pd.read_csv(f_proc, sep=",", header=None,
-                               names=["pid","burst","arrival","priority"])
-            # 2) Recursos
-            df_r = pd.read_csv(f_res, sep=",", header=None,
-                               names=["resource","initial_count"])
-            # 3) Acciones
-            df_a = pd.read_csv(f_act, sep=",", header=None,
-                               names=["pid","action","resource","time"])
+            # Parsear entradas
+            df_p = parse_processes_txt(f_proc)
+            df_r = parse_resources_txt(f_res)
+            df_a = parse_actions_txt(f_act)
 
-            sem_init = dict(zip(df_r.resource, df_r.initial_count))
-            df_tl = simulate_sync(df_a, sync_type, sem_init)
+            sem_init = {r: c for r, c in zip(df_r.resource, df_r.initial_count)}
 
-            # Llamamos con sem_init en el caso de semáforos
-            animate_sync_visual(df_tl, sync_type, sem_init=sem_init, delay=0.8)
+            # Simulación y construcción de df_state para cada modo
+            sync_results = {}
+            for mode in sync_modes:
+                df_tl = simulate_sync(df_a, mode, sem_init if mode == "Semaphore" else None)
 
+                # Construir df_state ciclo a ciclo
+                times = sorted(df_tl['time'].unique())
+                resources = sorted(df_tl['resource'].unique())
+                state = {r: (1 if mode == "Mutex" else sem_init[r]) for r in resources}
+                records = []
+                for t in times:
+                    for _, ev in df_tl[df_tl.time == t].iterrows():
+                        if mode == "Mutex":
+                            state[ev.resource] = 0 if ev.status == "acquired" else 1
+                        else:
+                            delta = -1 if ev.status == "acquired" else +1
+                            state[ev.resource] += delta
+                    rec = {'time': t}
+                    rec.update(state)
+                    records.append(rec)
+                df_state = pd.DataFrame(records)
+
+                sync_results[mode] = {
+                    'df_tl': df_tl,
+                    'df_state': df_state,
+                    'resources': resources
+                }
+
+            # UI: columnas para cada modo
+            cols = st.columns(len(sync_modes))
+            line_ph = {}
+            event_ph = {}
+            for idx, mode in enumerate(sync_modes):
+                cols[idx].subheader(mode)
+                line_ph[mode] = cols[idx].empty()
+                event_ph[mode] = cols[idx].empty()
+
+            # Animar simultáneamente
+            global_max = max(res['df_state']['time'].max() for res in sync_results.values())
+            delay = 0.5
+            for t in range(global_max + 1):
+                for mode, res in sync_results.items():
+                    df_state = res['df_state']
+                    df_tl = res['df_tl']
+                    resources = res['resources']
+
+                    # Línea de estados
+                    df_plot = df_state[df_state['time'] <= t]
+                    fig = px.line(
+                        df_plot,
+                        x='time', y=resources,
+                        labels={'time':'Ciclo','value':'Estado','variable':'Recurso'},
+                        title=f"{mode} — Ciclo {t}/{global_max}"
+                    )
+                    fig.update_layout(height=300, margin=dict(l=40,r=20,t=40,b=20))
+                    line_ph[mode].plotly_chart(
+                        fig,
+                        use_container_width=True,
+                        key=f"{mode}_line_{t}"
+                    )
+
+                    # Eventos ocurridos en t
+                    acts = df_tl[df_tl['time'] == t]
+                    if not acts.empty:
+                        textos = []
+                        for _, ev in acts.iterrows():
+                            icon = '🟢' if ev.status=='acquired' else '🔴'
+                            verbo = 'adquirió' if ev.status=='acquired' else 'liberó'
+                            textos.append(f"{icon} `{ev.pid}` **{verbo}** `{ev.resource}`")
+                        event_ph[mode].markdown("**Eventos:**" + " ".join(textos))
+                    else:
+                        event_ph[mode].empty()
+
+                time.sleep(delay)
+
+            # Métricas de sincronización por recurso
+            from collections import deque
+            metrics_sync = []
+            for mode, res in sync_results.items():
+                df_tl = res['df_tl']
+                resources = res['resources']
+                queues = {r: deque() for r in resources}
+                queue_sizes = {r: 0 for r in resources}
+                pending_wait = {}
+                pending_hold = {}
+                wait_times = []
+                hold_times = []
+                for _, row in df_tl.sort_values('time').iterrows():
+                    t,pid,status,rsrc = row['time'], row['pid'], row['status'], row['resource']
+                    key = (pid, rsrc)
+                    if status == 'waiting':
+                        queues[rsrc].append(pid)
+                        queue_sizes[rsrc] = max(queue_sizes[rsrc], len(queues[rsrc]))
+                        pending_wait[key] = t
+                    elif status == 'acquired':
+                        if key in pending_wait:
+                            wait_times.append(t - pending_wait.pop(key))
+                        pending_hold[key] = t
+                        if pid in queues[rsrc]: queues[rsrc].remove(pid)
+                    else:
+                        if key in pending_hold:
+                            hold_times.append(t - pending_hold.pop(key))
+                avg_wait = sum(wait_times)/len(wait_times) if wait_times else 0
+                avg_hold = sum(hold_times)/len(hold_times) if hold_times else 0
+                for r in resources:
+                    metrics_sync.append({
+                        'Modo': mode,
+                        'Recurso': r,
+                        'Espera Media': avg_wait,
+                        'Uso Medio': avg_hold,
+                        'Pico Cola': queue_sizes[r]
+                    })
+
+            df_ms = pd.DataFrame(metrics_sync).set_index(['Modo','Recurso'])
+            st.subheader("📊 Métricas de Sincronización")
+            st.dataframe(df_ms)
+            fig_sync = px.bar(
+                df_ms.reset_index(),
+                x='Recurso', y=['Espera Media','Uso Medio','Pico Cola'],
+                color='Modo', barmode='group',
+                labels={'value':'Ciclos','variable':'Métrica'},
+                title='Comparativa de Métricas de Sincronización'
+            )
+            fig_sync.update_layout(margin=dict(l=40,r=40,t=60,b=40))
+            st.plotly_chart(fig_sync, use_container_width=True)
+            st.success(f"✅ Sincronización completada para: {', '.join(sync_modes)}")
 
 
 if __name__ == "__main__":
