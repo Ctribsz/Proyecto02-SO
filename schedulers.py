@@ -15,131 +15,199 @@ class Process:
             self.remaining = self.burst
 
 def fifo_scheduler(processes):
+    """FIFO/FCFS - First In First Out"""
     time_ptr = 0
-    tl = []
+    timeline = []
     for p in sorted(processes, key=lambda x: x.arrival):
         start = max(time_ptr, p.arrival)
         end = start + p.burst
-        tl.append((p.pid, start, end))
+        timeline.append((p.pid, start, end))
         time_ptr = end
-    return tl
+    return timeline
 
 def sjf_scheduler(procs: list[Process]) -> list[tuple]:
-    """SJF no-preemptivo."""
+    """SJF no-preemptivo - Shortest Job First"""
     time = 0
     timeline = []
-    remaining = {p.pid: p for p in procs}
-    done = set()
-    while len(done) < len(procs):
-        ready = [p for p in procs if p.arrival <= time and p.pid not in done]
+    remaining = procs.copy()  # Procesos pendientes
+    
+    while remaining:
+        # Filtrar procesos que ya han llegado
+        ready = [p for p in remaining if p.arrival <= time]
+        
         if ready:
-            p = min(ready, key=lambda x: x.burst)
-            start = max(time, p.arrival)
-            end = start + p.burst
-            timeline.append((p.pid, start, end))
+            # Seleccionar el de menor burst time
+            shortest = min(ready, key=lambda x: x.burst)
+            start = max(time, shortest.arrival)
+            end = start + shortest.burst
+            timeline.append((shortest.pid, start, end))
             time = end
-            done.add(p.pid)
+            remaining.remove(shortest)
         else:
-            time += 1
+            # Si no hay procesos listos, avanzar al siguiente arrival
+            next_arrival = min(p.arrival for p in remaining)
+            time = next_arrival
+    
     return timeline
 
 def srt_scheduler(procs: list[Process]) -> list[tuple]:
-    """SRT preemptivo."""
+    """SRT preemptivo - Shortest Remaining Time"""
     time = 0
-    rem = {p.pid: p.burst for p in procs}
+    remaining = {p.pid: p.burst for p in procs}
     timeline = []
-    current, start = None, 0
+    current_process = None
+    current_start = 0
 
-    while True:
-        arrived = [p for p in procs if p.arrival <= time and rem[p.pid] > 0]
-        if arrived:
-            p = min(arrived, key=lambda x: rem[x.pid])
-            if current != p.pid:
-                if current is not None:
-                    timeline.append((current, start, time))
-                current, start = p.pid, time
-            rem[p.pid] -= 1
+    while any(remaining.values()):
+        # Procesos que han llegado y aún tienen tiempo restante
+        ready = [p for p in procs if p.arrival <= time and remaining[p.pid] > 0]
+        
+        if ready:
+            # Seleccionar el de menor tiempo restante
+            shortest = min(ready, key=lambda x: remaining[x.pid])
+            
+            # Si cambia el proceso en ejecución
+            if current_process != shortest.pid:
+                if current_process is not None:
+                    timeline.append((current_process, current_start, time))
+                current_process = shortest.pid
+                current_start = time
+            
+            # Ejecutar por una unidad de tiempo
+            remaining[shortest.pid] -= 1
+            time += 1
         else:
-            # si no hay ready y todo está hecho, cortamos
-            if all(v == 0 for v in rem.values()):
-                break
-        time += 1
+            # Si no hay procesos listos, avanzar al siguiente arrival
+            if any(remaining.values()):
+                next_arrival = min(p.arrival for p in procs if remaining[p.pid] > 0)
+                time = next_arrival
 
-    if current is not None:
-        timeline.append((current, start, time))
+    # Agregar el último segmento si existe
+    if current_process is not None:
+        timeline.append((current_process, current_start, time))
+    
     return timeline
 
 def rr_scheduler(procs: list[Process], quantum: int) -> list[tuple]:
-    """Round Robin preemptivo."""
+    """Round Robin preemptivo"""
     time = 0
     queue = deque()
     timeline = []
-    rem = {p.pid: p.burst for p in procs}
+    remaining = {p.pid: p.burst for p in procs}
     sorted_procs = sorted(procs, key=lambda x: x.arrival)
-    idx = 0
+    next_arrival_idx = 0
+    in_queue = set()  # Para evitar duplicados en la cola
 
-    while True:
-        # encolar llegadas
-        while idx < len(sorted_procs) and sorted_procs[idx].arrival <= time:
-            queue.append(sorted_procs[idx].pid)
-            idx += 1
+    while any(remaining.values()) or queue:
+        # Agregar procesos que han llegado a la cola
+        while (next_arrival_idx < len(sorted_procs) and 
+               sorted_procs[next_arrival_idx].arrival <= time):
+            proc = sorted_procs[next_arrival_idx]
+            if proc.pid not in in_queue and remaining[proc.pid] > 0:
+                queue.append(proc.pid)
+                in_queue.add(proc.pid)
+            next_arrival_idx += 1
 
         if not queue:
-            if idx < len(sorted_procs):
-                time = sorted_procs[idx].arrival
+            # Si no hay procesos en cola, avanzar al siguiente arrival
+            if next_arrival_idx < len(sorted_procs):
+                time = sorted_procs[next_arrival_idx].arrival
                 continue
             else:
                 break
 
+        # Ejecutar el proceso al frente de la cola
         pid = queue.popleft()
-        slice_len = min(quantum, rem[pid])
-        start, end = time, time + slice_len
-        timeline.append((pid, start, end))
-        rem[pid] -= slice_len
-        time = end
+        in_queue.remove(pid)
+        
+        if remaining[pid] > 0:
+            execution_time = min(quantum, remaining[pid])
+            start_time = time
+            end_time = time + execution_time
+            timeline.append((pid, start_time, end_time))
+            remaining[pid] -= execution_time
+            time = end_time
 
-        # encolar nuevas llegadas durante el slice
-        while idx < len(sorted_procs) and sorted_procs[idx].arrival <= time:
-            queue.append(sorted_procs[idx].pid)
-            idx += 1
-        if rem[pid] > 0:
-            queue.append(pid)
+            # Agregar nuevos arrivals durante la ejecución
+            while (next_arrival_idx < len(sorted_procs) and 
+                   sorted_procs[next_arrival_idx].arrival <= time):
+                proc = sorted_procs[next_arrival_idx]
+                if proc.pid not in in_queue and remaining[proc.pid] > 0:
+                    queue.append(proc.pid)
+                    in_queue.add(proc.pid)
+                next_arrival_idx += 1
+
+            # Si el proceso no terminó, regresarlo a la cola
+            if remaining[pid] > 0:
+                queue.append(pid)
+                in_queue.add(pid)
 
     return timeline
 
 def priority_scheduler(procs: list[Process], preemptive: bool) -> list[tuple]:
-    """Priority, preemptivo o no."""
+    """Priority Scheduling - preemptivo o no preemptivo"""
     time = 0
-    rem = {p.pid: p.burst for p in procs}
-    prio = {p.pid: p.priority for p in procs}
+    remaining = {p.pid: p.burst for p in procs}
     timeline = []
-    current, start = None, 0
+    current_process = None
+    current_start = 0
 
-    while True:
-        ready = [p for p in procs if p.arrival <= time and rem[p.pid] > 0]
-        if ready:
-            p = min(ready, key=lambda x: prio[x.pid])
-            if preemptive:
-                if current != p.pid:
-                    if current is not None:
-                        timeline.append((current, start, time))
-                    current, start = p.pid, time
-                rem[p.pid] -= 1
+    if preemptive:
+        # Priority preemptivo
+        while any(remaining.values()):
+            # Procesos listos (han llegado y tienen tiempo restante)
+            ready = [p for p in procs if p.arrival <= time and remaining[p.pid] > 0]
+            
+            if ready:
+                # Seleccionar el de mayor prioridad (menor número = mayor prioridad)
+                highest_priority = min(ready, key=lambda x: x.priority)
+                
+                # Si cambia el proceso en ejecución
+                if current_process != highest_priority.pid:
+                    if current_process is not None:
+                        timeline.append((current_process, current_start, time))
+                    current_process = highest_priority.pid
+                    current_start = time
+                
+                # Ejecutar por una unidad de tiempo
+                remaining[highest_priority.pid] -= 1
                 time += 1
             else:
-                # run to completion
-                st = max(time, p.arrival)
-                en = st + rem[p.pid]
-                timeline.append((p.pid, st, en))
-                time = en
-                rem[p.pid] = 0
-        else:
-            if all(v == 0 for v in rem.values()):
-                break
-            # avanzar al siguiente arribo
-            next_arrival = min(p.arrival for p in procs if rem[p.pid] > 0)
-            time = next_arrival
+                # Si no hay procesos listos, avanzar al siguiente arrival
+                if any(remaining.values()):
+                    next_arrival = min(p.arrival for p in procs if remaining[p.pid] > 0)
+                    time = next_arrival
 
-    if preemptive and current is not None:
-        timeline.append((current, start, time))
+        # Agregar el último segmento
+        if current_process is not None:
+            timeline.append((current_process, current_start, time))
+    
+    else:
+        # Priority no preemptivo
+        remaining_procs = procs.copy()
+        
+        while remaining_procs:
+            # Procesos que han llegado
+            ready = [p for p in remaining_procs if p.arrival <= time]
+            
+            if ready:
+                # Seleccionar el de mayor prioridad
+                highest_priority = min(ready, key=lambda x: x.priority)
+                start_time = max(time, highest_priority.arrival)
+                end_time = start_time + highest_priority.burst
+                timeline.append((highest_priority.pid, start_time, end_time))
+                time = end_time
+                remaining_procs.remove(highest_priority)
+            else:
+                # Si no hay procesos listos, avanzar al siguiente arrival
+                next_arrival = min(p.arrival for p in remaining_procs)
+                time = next_arrival
+
     return timeline
+
+# Función auxiliar para mostrar resultados
+def print_timeline(timeline, algorithm_name):
+    print(f"\n{algorithm_name}:")
+    print("PID\tStart\tEnd")
+    for pid, start, end in timeline:
+        print(f"{pid}\t{start}\t{end}")

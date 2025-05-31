@@ -2,17 +2,16 @@ import pandas as pd
 
 def parse_processes_txt(file) -> pd.DataFrame:
     """
-    Lee procesos de un .txt con líneas: PID,arrival,burst[,priority]
-    Retorna DataFrame con columnas ['pid','arrival','burst','priority']
+    Lee procesos de un .txt con líneas: PID,BT,AT,Priority
+    Retorna DataFrame con columnas ['pid','burst','arrival','priority']
     """
     df = pd.read_csv(
         file,
         sep=",",
         header=None,
-        names=["pid","arrival","burst","priority"],
-        dtype={"pid": str, "arrival": int, "burst": int, "priority": float}
+        names=["pid","burst","arrival","priority"],
+        dtype={"pid": str, "burst": int, "arrival": int, "priority": int}
     )
-    df['priority'] = df['priority'].fillna(0).astype(int)
     return df
 
 
